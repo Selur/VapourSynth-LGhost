@@ -12,7 +12,7 @@ sources = [
 vapoursynth_dep = dependency('vapoursynth').partial_dependency(compile_args: true, includes: true)
 
 libs = []
-
+add_project_arguments('-O3', language: 'cpp')
 if host_machine.cpu_family().startswith('x86')
   add_project_arguments('-fno-math-errno', '-fno-trapping-math', '-DLGHOST_X86', '-mfpmath=sse', '-msse2', language: 'cpp')
 
@@ -52,8 +52,25 @@ if host_machine.cpu_family().startswith('x86')
     cpp_args: ['-mavx512f', '-mavx512vl', '-mavx512bw', '-mavx512dq', '-mfma'],
     gnu_symbol_visibility: 'hidden'
   )
-endif
 
+elif host_machine.cpu_family().startswith('arm') or host_machine.cpu_family() == 'aarch64'
+  project_args = ['-O3', '-funroll-loops', '-fno-math-errno', '-fno-trapping-math']
+  sources += [
+    'LGhost/LGhost_SSE2.cpp',
+    'LGhost/VCL2/instrset.h',
+    'LGhost/VCL2/instrset_detect.cpp',
+    'LGhost/VCL2/vector_convert.h',
+    'LGhost/VCL2/vectorclass.h',
+    'LGhost/VCL2/vectorf128.h',
+    'LGhost/VCL2/vectori128.h',
+    'LGhost/VCL2/vectormath_common.h',
+    'LGhost/VCL2/vectormath_exp.h',
+    'LGhost/VCL2/vectormath_hyp.h',
+    'LGhost/VCL2/vectormath_lib.h',
+    'LGhost/VCL2/vectormath_trig.h'
+  ]
+  add_project_arguments(project_args, language: 'cpp')
+endif
 shared_module('lghost', sources,
   dependencies: vapoursynth_dep,
   link_with: libs,

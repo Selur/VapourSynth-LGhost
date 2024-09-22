@@ -9,7 +9,7 @@
 #include <VapourSynth.h>
 #include <VSHelper.h>
 
-#ifdef LGHOST_X86
+#if defined(LGHOST_X86) || defined (__arm64)
 #include "VCL2/vectorclass.h"
 #endif
 

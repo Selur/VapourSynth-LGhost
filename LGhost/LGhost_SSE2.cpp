@@ -1,4 +1,4 @@
-#ifdef LGHOST_X86
+#if defined(LGHOST_X86) || defined (__arm64)
 #include "LGhost.h"
 
 template<typename pixel_t>

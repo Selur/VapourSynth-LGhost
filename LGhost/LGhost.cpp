@@ -25,10 +25,12 @@
 
 using namespace std::literals;
 
-#ifdef LGHOST_X86
+#if defined (LGHOSTX86) || defined (__arm64)
 template<typename pixel_t> extern void filter_sse2(const VSFrameRef * src, VSFrameRef * dst, const LGhostData * const VS_RESTRICT d, const VSAPI * vsapi) noexcept;
+#if defined (LGHOSTX86)
 template<typename pixel_t> extern void filter_avx2(const VSFrameRef * src, VSFrameRef * dst, const LGhostData * const VS_RESTRICT d, const VSAPI * vsapi) noexcept;
 template<typename pixel_t> extern void filter_avx512(const VSFrameRef * src, VSFrameRef * dst, const LGhostData * const VS_RESTRICT d, const VSAPI * vsapi) noexcept;
+#endif
 #endif
 
 template<typename pixel_t>
@@ -245,8 +247,18 @@ static void VS_CC lghostCreate(const VSMap * in, VSMap * out, void * userData, V
                     d->filter = filter_sse2<float>;
             }
 #endif
+#if defined (__arm64)
+            const int iset = instrset_detect();
+            if ((opt == 0 && iset >= 2) || opt == 2) {
+                if (d->vi->format->bytesPerSample == 1)
+                    d->filter = filter_sse2<uint8_t>;
+                else if (d->vi->format->bytesPerSample == 2)
+                    d->filter = filter_sse2<uint16_t>;
+                else
+                    d->filter = filter_sse2<float>;
+            }
         }
-
+#endif
         if (d->vi->format->sampleType == stInteger)
             d->peak = (1 << d->vi->format->bitsPerSample) - 1;
 
