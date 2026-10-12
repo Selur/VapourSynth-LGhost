@@ -36,7 +36,7 @@ remember that a dispatcher is not possible in this case.
 
 */
 
-#if __arm64
+#if defined(__arm64) || defined(__aarch64__) || defined(_M_ARM64)
 #include "sse2neon.h"
 
 // limit to 128byte, since we want to use ARM-neon

@@ -1,30 +1,27 @@
 #pragma once
 
 #include <memory>
-#include <thread>
 #include <type_traits>
-#include <unordered_map>
 #include <vector>
 
-#include <VapourSynth.h>
-#include <VSHelper.h>
+#include <VapourSynth4.h>
+#include <VSHelper4.h>
 
-#if defined(LGHOST_X86) || defined (__arm64)
+// The SSE2 path runs on x86 natively and on ARM64 through sse2neon (VCL2/instrset.h).
+#if defined(LGHOST_X86) || defined(__aarch64__) || defined(__arm64__) || defined(_M_ARM64)
+#define LGHOST_SIMD
 #include "VCL2/vectorclass.h"
 #endif
-
-using unique_float = std::unique_ptr<float[], decltype(&vs_aligned_free)>;
 
 struct OptionData final {
     int shift, intensity, startX, endX;
 };
 
 struct LGhostData final {
-    VSNodeRef * node;
+    VSNode * node;
     const VSVideoInfo * vi;
     bool process[3];
     std::vector<OptionData> options[3][4];
     int peak;
-    std::unordered_map<std::thread::id, unique_float> buffer;
-    void (*filter)(const VSFrameRef * src, VSFrameRef * dst, const LGhostData * const VS_RESTRICT d, const VSAPI * vsapi) noexcept;
+    void (*filter)(const VSFrame * src, VSFrame * dst, const LGhostData * const VS_RESTRICT d, const VSAPI * vsapi, void * lineBuffer) noexcept;
 };

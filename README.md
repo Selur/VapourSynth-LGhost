@@ -30,14 +30,32 @@ Usage
   * 3 = use avx2
   * 4 = use avx512
 
+  On ARM64 the sse2 path runs through sse2neon; avx2 and avx512 exist on x86 only.
+
 Each ghost consists of individual value from `mode`, `shift` and `intensity`. For example, `lghost.LGhost(mode=[2, 2, 1, 1], shift=[4, 7, -4, -7], intensity=[20, 10, -15, -5])` corresponds to four ghosts. The first ghost is (mode=2, shift=4, intensity=20), the second ghost is (mode=2, shift=7, intensity=10), and so on.
+
+
+VapourSynth API 4
+=================
+
+This fork targets the VapourSynth API 4 (R55 and newer, required since R80). The namespace, the function and its arguments are unchanged.
+The SIMD paths stop at the end of each ghost, so they read the same pixels as the C path and give bit-identical integer output
+(with a negative shift they used to add ghosts to the last columns from pixels beyond the line end).
+
+Wheels for Windows x64, Linux x86_64 and macOS arm64 are attached to the GitHub releases:
+
+    pip install vapoursynth_lghost-<version>-py3-none-<platform>.whl
+
+The wheel puts the plugin into site-packages/vapoursynth/plugins, where VapourSynth autoloads it.
 
 
 Compilation
 ===========
 
+Without system VapourSynth headers the vendored API 4 headers in include/vapoursynth are used.
+
 ```
-meson build
+meson setup build --buildtype release
 ninja -C build
-ninja -C build install
+python3 test/test_lghost.py build/liblghost.so
 ```

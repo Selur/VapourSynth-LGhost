@@ -1,13 +1,12 @@
-#if defined(LGHOST_X86) || defined (__arm64)
 #include "LGhost.h"
+#ifdef LGHOST_SIMD
 
 template<typename pixel_t>
-void filter_sse2(const VSFrameRef * src, VSFrameRef * dst, const LGhostData * const VS_RESTRICT d, const VSAPI * vsapi) noexcept {
+void filter_sse2(const VSFrame * src, VSFrame * dst, const LGhostData * const VS_RESTRICT d, const VSAPI * vsapi, void * lineBuffer) noexcept {
     using var_t = std::conditional_t<std::is_integral_v<pixel_t>, int, float>;
     using vec_t = std::conditional_t<std::is_integral_v<pixel_t>, Vec4i, Vec4f>;
 
-    const auto threadId = std::this_thread::get_id();
-    var_t * _buffer = reinterpret_cast<var_t *>(d->buffer.at(threadId).get());
+    var_t * _buffer = reinterpret_cast<var_t *>(lineBuffer);
 
     auto load = [](const pixel_t * srcp) noexcept {
         if constexpr (std::is_same_v<pixel_t, uint8_t>)
@@ -31,7 +30,7 @@ void filter_sse2(const VSFrameRef * src, VSFrameRef * dst, const LGhostData * co
         }
     };
 
-    for (int plane = 0; plane < d->vi->format->numPlanes; plane++) {
+    for (int plane = 0; plane < d->vi->format.numPlanes; plane++) {
         if (d->process[plane]) {
             const int width = vsapi->getFrameWidth(src, plane);
             const int height = vsapi->getFrameHeight(src, plane);
@@ -39,7 +38,6 @@ void filter_sse2(const VSFrameRef * src, VSFrameRef * dst, const LGhostData * co
             const pixel_t * _srcp = reinterpret_cast<const pixel_t *>(vsapi->getReadPtr(src, plane));
             pixel_t * dstp = reinterpret_cast<pixel_t *>(vsapi->getWritePtr(dst, plane));
 
-            const int regularPart = (width - 1) & ~(vec_t().size() - 1);
 
             for (int y = 0; y < height; y++) {
                 memset(_buffer, 0, width * sizeof(var_t));
@@ -49,7 +47,7 @@ void filter_sse2(const VSFrameRef * src, VSFrameRef * dst, const LGhostData * co
                     int x = 0;
 
                     if (it.endX - it.startX >= vec_t().size()) {
-                        for (x = it.startX; x - it.shift + 1 <= regularPart; x += vec_t().size()) {
+                        for (x = it.startX; x + vec_t().size() <= it.endX; x += vec_t().size()) {
                             const vec_t buffer = vec_t().load(_buffer + x);
                             const vec_t result = buffer + (load(_srcp + x - it.shift + 1) - load(_srcp + x - it.shift)) * intensity;
                             result.store(_buffer + x);
@@ -65,7 +63,7 @@ void filter_sse2(const VSFrameRef * src, VSFrameRef * dst, const LGhostData * co
                     int x = 0;
 
                     if (it.endX - it.startX >= vec_t().size()) {
-                        for (x = it.startX; x - it.shift <= regularPart; x += vec_t().size()) {
+                        for (x = it.startX; x + vec_t().size() <= it.endX; x += vec_t().size()) {
                             const vec_t buffer = vec_t().load(_buffer + x);
                             const vec_t result = buffer + load(_srcp + x - it.shift) * intensity;
                             result.store(_buffer + x);
@@ -81,7 +79,7 @@ void filter_sse2(const VSFrameRef * src, VSFrameRef * dst, const LGhostData * co
                     int x = 0;
 
                     if (it.endX - it.startX >= vec_t().size()) {
-                        for (x = it.startX; x - it.shift + 1 <= regularPart; x += vec_t().size()) {
+                        for (x = it.startX; x + vec_t().size() <= it.endX; x += vec_t().size()) {
                             const vec_t buffer = vec_t().load(_buffer + x);
                             const vec_t tempEdge = load(_srcp + x - it.shift + 1) - load(_srcp + x - it.shift);
                             const vec_t result = select(tempEdge > 0, buffer + tempEdge * intensity, buffer);
@@ -99,7 +97,7 @@ void filter_sse2(const VSFrameRef * src, VSFrameRef * dst, const LGhostData * co
                     int x = 0;
 
                     if (it.endX - it.startX >= vec_t().size()) {
-                        for (x = it.startX; x - it.shift + 1 <= regularPart; x += vec_t().size()) {
+                        for (x = it.startX; x + vec_t().size() <= it.endX; x += vec_t().size()) {
                             const vec_t buffer = vec_t().load(_buffer + x);
                             const vec_t tempEdge = load(_srcp + x - it.shift + 1) - load(_srcp + x - it.shift);
                             const vec_t result = select(tempEdge < 0, buffer + tempEdge * intensity, buffer);
@@ -125,7 +123,7 @@ void filter_sse2(const VSFrameRef * src, VSFrameRef * dst, const LGhostData * co
     }
 }
 
-template void filter_sse2<uint8_t>(const VSFrameRef * src, VSFrameRef * dst, const LGhostData * const VS_RESTRICT d, const VSAPI * vsapi) noexcept;
-template void filter_sse2<uint16_t>(const VSFrameRef * src, VSFrameRef * dst, const LGhostData * const VS_RESTRICT d, const VSAPI * vsapi) noexcept;
-template void filter_sse2<float>(const VSFrameRef * src, VSFrameRef * dst, const LGhostData * const VS_RESTRICT d, const VSAPI * vsapi) noexcept;
+template void filter_sse2<uint8_t>(const VSFrame * src, VSFrame * dst, const LGhostData * const VS_RESTRICT d, const VSAPI * vsapi, void * lineBuffer) noexcept;
+template void filter_sse2<uint16_t>(const VSFrame * src, VSFrame * dst, const LGhostData * const VS_RESTRICT d, const VSAPI * vsapi, void * lineBuffer) noexcept;
+template void filter_sse2<float>(const VSFrame * src, VSFrame * dst, const LGhostData * const VS_RESTRICT d, const VSAPI * vsapi, void * lineBuffer) noexcept;
 #endif

@@ -17,6 +17,7 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 #include <cstdlib>
+#include <cstring>
 
 #include <algorithm>
 #include <string>
@@ -25,22 +26,21 @@
 
 using namespace std::literals;
 
-#if defined (LGHOSTX86) || defined (__arm64)
-template<typename pixel_t> extern void filter_sse2(const VSFrameRef * src, VSFrameRef * dst, const LGhostData * const VS_RESTRICT d, const VSAPI * vsapi) noexcept;
-#if defined (LGHOSTX86)
-template<typename pixel_t> extern void filter_avx2(const VSFrameRef * src, VSFrameRef * dst, const LGhostData * const VS_RESTRICT d, const VSAPI * vsapi) noexcept;
-template<typename pixel_t> extern void filter_avx512(const VSFrameRef * src, VSFrameRef * dst, const LGhostData * const VS_RESTRICT d, const VSAPI * vsapi) noexcept;
+#ifdef LGHOST_SIMD
+template<typename pixel_t> extern void filter_sse2(const VSFrame * src, VSFrame * dst, const LGhostData * const VS_RESTRICT d, const VSAPI * vsapi, void * lineBuffer) noexcept;
 #endif
+#ifdef LGHOST_X86
+template<typename pixel_t> extern void filter_avx2(const VSFrame * src, VSFrame * dst, const LGhostData * const VS_RESTRICT d, const VSAPI * vsapi, void * lineBuffer) noexcept;
+template<typename pixel_t> extern void filter_avx512(const VSFrame * src, VSFrame * dst, const LGhostData * const VS_RESTRICT d, const VSAPI * vsapi, void * lineBuffer) noexcept;
 #endif
 
 template<typename pixel_t>
-static void filter_c(const VSFrameRef * src, VSFrameRef * dst, const LGhostData * const VS_RESTRICT d, const VSAPI * vsapi) noexcept {
+static void filter_c(const VSFrame * src, VSFrame * dst, const LGhostData * const VS_RESTRICT d, const VSAPI * vsapi, void * lineBuffer) noexcept {
     using var_t = std::conditional_t<std::is_integral_v<pixel_t>, int, float>;
 
-    const auto threadId = std::this_thread::get_id();
-    var_t * buffer = reinterpret_cast<var_t *>(d->buffer.at(threadId).get());
+    var_t * buffer = reinterpret_cast<var_t *>(lineBuffer);
 
-    for (int plane = 0; plane < d->vi->format->numPlanes; plane++) {
+    for (int plane = 0; plane < d->vi->format.numPlanes; plane++) {
         if (d->process[plane]) {
             const int width = vsapi->getFrameWidth(src, plane);
             const int height = vsapi->getFrameHeight(src, plane);
@@ -83,38 +83,27 @@ static void filter_c(const VSFrameRef * src, VSFrameRef * dst, const LGhostData 
     }
 }
 
-static void VS_CC lghostInit(VSMap * in, VSMap * out, void ** instanceData, VSNode * node, VSCore * core, const VSAPI * vsapi) {
-    LGhostData * d = static_cast<LGhostData *>(*instanceData);
-    vsapi->setVideoInfo(d->vi, 1, node);
-}
-
-static const VSFrameRef * VS_CC lghostGetFrame(int n, int activationReason, void ** instanceData, void ** frameData, VSFrameContext * frameCtx, VSCore * core, const VSAPI * vsapi) {
-    LGhostData * d = static_cast<LGhostData *>(*instanceData);
+static const VSFrame * VS_CC lghostGetFrame(int n, int activationReason, void * instanceData, void ** frameData, VSFrameContext * frameCtx, VSCore * core, const VSAPI * vsapi) {
+    LGhostData * d = static_cast<LGhostData *>(instanceData);
 
     if (activationReason == arInitial) {
         vsapi->requestFrameFilter(n, d->node, frameCtx);
     } else if (activationReason == arAllFramesReady) {
-        try {
-            auto threadId = std::this_thread::get_id();
-
-            if (!d->buffer.count(threadId)) {
-                float * buffer = vs_aligned_malloc<float>((d->vi->width + 15) * sizeof(float), 64);
-                if (!buffer)
-                    throw "malloc failure (buffer)";
-                d->buffer.emplace(threadId, unique_float{ buffer, vs_aligned_free });
-            }
-        } catch (const char * error) {
-            vsapi->setFilterError(("LGhost: "s + error).c_str(), frameCtx);
+        // One line of int or float per call; the SIMD paths read up to 15 elements past the width.
+        float * buffer = vsh::vsh_aligned_malloc<float>((d->vi->width + 15) * sizeof(float), 64);
+        if (!buffer) {
+            vsapi->setFilterError("LGhost: malloc failure (buffer)", frameCtx);
             return nullptr;
         }
 
-        const VSFrameRef * src = vsapi->getFrameFilter(n, d->node, frameCtx);
-        const VSFrameRef * fr[] = { d->process[0] ? nullptr : src, d->process[1] ? nullptr : src, d->process[2] ? nullptr : src };
+        const VSFrame * src = vsapi->getFrameFilter(n, d->node, frameCtx);
+        const VSFrame * fr[] = { d->process[0] ? nullptr : src, d->process[1] ? nullptr : src, d->process[2] ? nullptr : src };
         const int pl[] = { 0, 1, 2 };
-        VSFrameRef * dst = vsapi->newVideoFrame2(d->vi->format, d->vi->width, d->vi->height, fr, pl, src, core);
+        VSFrame * dst = vsapi->newVideoFrame2(&d->vi->format, d->vi->width, d->vi->height, fr, pl, src, core);
 
-        d->filter(src, dst, d, vsapi);
+        d->filter(src, dst, d, vsapi, buffer);
 
+        vsh::vsh_aligned_free(buffer);
         vsapi->freeFrame(src);
         return dst;
     }
@@ -128,42 +117,60 @@ static void VS_CC lghostFree(void * instanceData, VSCore * core, const VSAPI * v
     delete d;
 }
 
+template<typename pixel_t>
+static void selectFilter(LGhostData * d, const int opt) {
+    d->filter = filter_c<pixel_t>;
+#ifdef LGHOST_X86
+    const int iset = instrset_detect();
+    if ((opt == 0 && iset >= 10) || opt == 4)
+        d->filter = filter_avx512<pixel_t>;
+    else if ((opt == 0 && iset >= 8) || opt == 3)
+        d->filter = filter_avx2<pixel_t>;
+    else if ((opt == 0 && iset >= 2) || opt == 2)
+        d->filter = filter_sse2<pixel_t>;
+#elif defined(LGHOST_SIMD)
+    // ARM64: NEON through sse2neon, there are no AVX2/AVX-512 paths.
+    if (opt == 0 || opt == 2)
+        d->filter = filter_sse2<pixel_t>;
+#endif
+}
+
 static void VS_CC lghostCreate(const VSMap * in, VSMap * out, void * userData, VSCore * core, const VSAPI * vsapi) {
     std::unique_ptr<LGhostData> d = std::make_unique<LGhostData>();
 
     try {
-        d->node = vsapi->propGetNode(in, "clip", 0, nullptr);
+        d->node = vsapi->mapGetNode(in, "clip", 0, nullptr);
         d->vi = vsapi->getVideoInfo(d->node);
         int err;
 
-        if (!isConstantFormat(d->vi) ||
-            (d->vi->format->sampleType == stInteger && d->vi->format->bitsPerSample > 16) ||
-            (d->vi->format->sampleType == stFloat && d->vi->format->bitsPerSample != 32))
+        if (!vsh::isConstantVideoFormat(d->vi) ||
+            (d->vi->format.sampleType == stInteger && d->vi->format.bitsPerSample > 16) ||
+            (d->vi->format.sampleType == stFloat && d->vi->format.bitsPerSample != 32))
             throw "only constant format 8-16 bit integer and 32 bit float input supported";
 
-        const int64_t * modeArray = vsapi->propGetIntArray(in, "mode", nullptr);
-        const int64_t * shiftArray = vsapi->propGetIntArray(in, "shift", nullptr);
-        const int64_t * intensityArray = vsapi->propGetIntArray(in, "intensity", nullptr);
+        const int64_t * modeArray = vsapi->mapGetIntArray(in, "mode", nullptr);
+        const int64_t * shiftArray = vsapi->mapGetIntArray(in, "shift", nullptr);
+        const int64_t * intensityArray = vsapi->mapGetIntArray(in, "intensity", nullptr);
 
-        const int numMode = vsapi->propNumElements(in, "mode");
-        const int numShift = vsapi->propNumElements(in, "shift");
-        const int numIntensity = vsapi->propNumElements(in, "intensity");
+        const int numMode = vsapi->mapNumElements(in, "mode");
+        const int numShift = vsapi->mapNumElements(in, "shift");
+        const int numIntensity = vsapi->mapNumElements(in, "intensity");
 
         {
-            const int m = vsapi->propNumElements(in, "planes");
+            const int m = vsapi->mapNumElements(in, "planes");
 
             if (m <= 0) {
                 for (int i = 0; i < 3; i++) {
                     d->process[i] = true;
-                    if (i == 0 && d->vi->format->colorFamily != cmRGB)
+                    if (i == 0 && d->vi->format.colorFamily != cfRGB)
                         break;
                 }
             }
 
             for (int i = 0; i < m; i++) {
-                const int n = int64ToIntS(vsapi->propGetInt(in, "planes", i, nullptr));
+                const int n = vsh::int64ToIntS(vsapi->mapGetInt(in, "planes", i, nullptr));
 
-                if (n < 0 || n >= d->vi->format->numPlanes)
+                if (n < 0 || n >= d->vi->format.numPlanes)
                     throw "plane index out of range";
 
                 if (d->process[n])
@@ -173,14 +180,14 @@ static void VS_CC lghostCreate(const VSMap * in, VSMap * out, void * userData, V
             }
         }
 
-        const int opt = int64ToIntS(vsapi->propGetInt(in, "opt", 0, &err));
+        const int opt = vsh::int64ToIntS(vsapi->mapGetInt(in, "opt", 0, &err));
 
         if (numMode != numShift || numMode != numIntensity)
             throw "number of elements in mode, shift and intensity must equal";
 
         for (int i = 0; i < numMode; i++) {
-            const int mode = int64ToIntS(modeArray[i]);
-            const int intensity = int64ToIntS(intensityArray[i]);
+            const int mode = vsh::int64ToIntS(modeArray[i]);
+            const int intensity = vsh::int64ToIntS(intensityArray[i]);
 
             if (mode < 1 || mode > 4)
                 throw "mode must be 1, 2, 3, or 4";
@@ -188,10 +195,10 @@ static void VS_CC lghostCreate(const VSMap * in, VSMap * out, void * userData, V
             if (intensity == 0 || intensity < -128 || intensity > 127)
                 throw "intensity must not be 0 and must be between -128 and 127 (inclusive)";
 
-            for (int plane = 0; plane < d->vi->format->numPlanes; plane++) {
+            for (int plane = 0; plane < d->vi->format.numPlanes; plane++) {
                 if (d->process[plane]) {
-                    int shift = int64ToIntS(shiftArray[i]);
-                    int width = d->vi->width >> (plane ? d->vi->format->subSamplingW : 0);
+                    int shift = vsh::int64ToIntS(shiftArray[i]);
+                    int width = d->vi->width >> (plane ? d->vi->format.subSamplingW : 0);
 
                     if (std::abs(shift) >= width)
                         throw "abs(shift) must be less than plane's width";
@@ -214,75 +221,38 @@ static void VS_CC lghostCreate(const VSMap * in, VSMap * out, void * userData, V
         if (opt < 0 || opt > 4)
             throw "opt must be 0, 1, 2, 3, or 4";
 
-        {
-            if (d->vi->format->bytesPerSample == 1)
-                d->filter = filter_c<uint8_t>;
-            else if (d->vi->format->bytesPerSample == 2)
-                d->filter = filter_c<uint16_t>;
-            else
-                d->filter = filter_c<float>;
+        if (d->vi->format.bytesPerSample == 1)
+            selectFilter<uint8_t>(d.get(), opt);
+        else if (d->vi->format.bytesPerSample == 2)
+            selectFilter<uint16_t>(d.get(), opt);
+        else
+            selectFilter<float>(d.get(), opt);
 
-#ifdef LGHOST_X86
-            const int iset = instrset_detect();
-            if ((opt == 0 && iset >= 10) || opt == 4) {
-                if (d->vi->format->bytesPerSample == 1)
-                    d->filter = filter_avx512<uint8_t>;
-                else if (d->vi->format->bytesPerSample == 2)
-                    d->filter = filter_avx512<uint16_t>;
-                else
-                    d->filter = filter_avx512<float>;
-            } else if ((opt == 0 && iset >= 8) || opt == 3) {
-                if (d->vi->format->bytesPerSample == 1)
-                    d->filter = filter_avx2<uint8_t>;
-                else if (d->vi->format->bytesPerSample == 2)
-                    d->filter = filter_avx2<uint16_t>;
-                else
-                    d->filter = filter_avx2<float>;
-            } else if ((opt == 0 && iset >= 2) || opt == 2) {
-                if (d->vi->format->bytesPerSample == 1)
-                    d->filter = filter_sse2<uint8_t>;
-                else if (d->vi->format->bytesPerSample == 2)
-                    d->filter = filter_sse2<uint16_t>;
-                else
-                    d->filter = filter_sse2<float>;
-            }
-#endif
-#if defined (__arm64)
-            const int iset = instrset_detect();
-            if ((opt == 0 && iset >= 2) || opt == 2) {
-                if (d->vi->format->bytesPerSample == 1)
-                    d->filter = filter_sse2<uint8_t>;
-                else if (d->vi->format->bytesPerSample == 2)
-                    d->filter = filter_sse2<uint16_t>;
-                else
-                    d->filter = filter_sse2<float>;
-            }
-        }
-#endif
-        if (d->vi->format->sampleType == stInteger)
-            d->peak = (1 << d->vi->format->bitsPerSample) - 1;
-
-        d->buffer.reserve(vsapi->getCoreInfo(core)->numThreads);
+        if (d->vi->format.sampleType == stInteger)
+            d->peak = (1 << d->vi->format.bitsPerSample) - 1;
     } catch (const char * error) {
-        vsapi->setError(out, ("LGhost: "s + error).c_str());
+        vsapi->mapSetError(out, ("LGhost: "s + error).c_str());
         vsapi->freeNode(d->node);
         return;
     }
 
-    vsapi->createFilter(in, out, "LGhost", lghostInit, lghostGetFrame, lghostFree, fmParallel, 0, d.release(), core);
+    VSFilterDependency deps[] = { { d->node, rpStrictSpatial } };
+    LGhostData * data = d.release();
+    vsapi->createVideoFilter(out, "LGhost", data->vi, lghostGetFrame, lghostFree, fmParallel, deps, 1, data, core);
 }
 
 //////////////////////////////////////////
 // Init
 
-VS_EXTERNAL_API(void) VapourSynthPluginInit(VSConfigPlugin configFunc, VSRegisterFunction registerFunc, VSPlugin * plugin) {
-    configFunc("com.holywu.lghost", "lghost", "Ghost Reduction", VAPOURSYNTH_API_VERSION, 1, plugin);
-    registerFunc("LGhost",
-                 "clip:clip;"
-                 "mode:int[];"
-                 "shift:int[];"
-                 "intensity:int[];"
-                 "planes:int[]:opt;"
-                 "opt:int:opt;",
-                 lghostCreate, nullptr, plugin);
+VS_EXTERNAL_API(void) VapourSynthPluginInit2(VSPlugin * plugin, const VSPLUGINAPI * vspapi) {
+    vspapi->configPlugin("com.holywu.lghost", "lghost", "Ghost Reduction", VS_MAKE_VERSION(1, 1), VAPOURSYNTH_API_VERSION, 0, plugin);
+    vspapi->registerFunction("LGhost",
+                             "clip:vnode;"
+                             "mode:int[];"
+                             "shift:int[];"
+                             "intensity:int[];"
+                             "planes:int[]:opt;"
+                             "opt:int:opt;",
+                             "clip:vnode;",
+                             lghostCreate, nullptr, plugin);
 }
