@@ -71,6 +71,26 @@ def textured(width, height, frames=2):
     return core.std.Splice(out)
 
 
+def supported_opts():
+    """opt values this CPU can run: opt forces a path without checking the CPU, AVX2/AVX-512 would crash without them."""
+    import platform
+    machine = platform.machine().lower()
+    if machine in ("arm64", "aarch64"):
+        return [0, 1, 2]
+    if machine not in ("x86_64", "amd64"):
+        return [0, 1]
+    avx2 = avx512 = False
+    if sys.platform == "win32":
+        import ctypes
+        present = ctypes.windll.kernel32.IsProcessorFeaturePresent
+        avx2, avx512 = bool(present(40)), bool(present(41))
+    elif os.path.exists("/proc/cpuinfo"):
+        flags = open("/proc/cpuinfo").read().split()
+        avx2 = "avx2" in flags and "fma" in flags
+        avx512 = all(f in flags for f in ("avx512f", "avx512vl", "avx512bw", "avx512dq"))
+    return [0, 1, 2] + ([3] if avx2 else []) + ([4] if avx512 else [])
+
+
 def row(clip):
     f = clip.get_frame(0)
     return [f[0][2, x] for x in range(f.width)]
@@ -97,13 +117,15 @@ def main():
         check(abs(out[20] - value) < 1e-6 and abs(out[24] - expected) < 1e-6 and not any(others),
               "%s mode 2: ghost of half the line value 4 pixels to the right" % fmt.name)
 
-    # All code paths give the same result where the CPU has them (opt 2-4 fall back to C when not available).
+    # Every code path this CPU can run gives the same result as the C path.
+    opts = [o for o in supported_opts() if o != 1]
+    print("     opt values checked:", opts)
     src = textured(202, 38)
     for fmt in (vs.YUV420P8, vs.YUV420P16, vs.YUV444PS):
         clip = src.resize.Point(format=fmt)
         args = dict(mode=[1, 2, 3, 4], shift=[3, -5, 7, -2], intensity=[40, -20, 90, -100])
         ref = digest(core.lghost.LGhost(clip, opt=1, **args))
-        same = [digest(core.lghost.LGhost(clip, opt=o, **args)) == ref for o in (0, 2, 3, 4)]
+        same = [digest(core.lghost.LGhost(clip, opt=o, **args)) == ref for o in opts]
         if fmt == vs.YUV444PS:
             # Float: the SIMD paths use fused multiply-add, compare with a tolerance instead.
             a = core.lghost.LGhost(clip, opt=1, **args)
@@ -111,7 +133,7 @@ def main():
             diff = core.std.PlaneStats(core.std.Expr([a, b], "x y - abs"), plane=0).get_frame(0).props["PlaneStatsMax"]
             check(diff < 1e-5, "%s: C and SIMD path within 1e-5 (max %g)" % (core.get_video_format(fmt).name, diff))
         else:
-            check(all(same), "%s: opt 0-4 bit-identical to the C path" % core.get_video_format(fmt).name)
+            check(all(same), "%s: every opt bit-identical to the C path" % core.get_video_format(fmt).name)
 
     clip = core.std.BlankClip(width=64, height=8, format=vs.YUV420P8, length=1)
     expect_error(lambda: core.lghost.LGhost(core.std.BlankClip(format=vs.YUV420P10).resize.Point(format=vs.YUV420PH), mode=[1], shift=[1], intensity=[1]),
