@@ -2,7 +2,7 @@ project('LGhost', 'cpp',
   default_options : ['buildtype=release', 'b_ndebug=if-release', 'cpp_std=c++17'],
   meson_version : '>=0.51.0',
   license : 'GPL-3.0',
-  version : '1.1.0'
+  version : '1.1.1'
 )
 
 # Prefer system VapourSynth headers, fall back to the vendored API 4 headers.
